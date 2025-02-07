@@ -3,11 +3,13 @@ package main
 import (
 	"compress/bzip2"
 	"crypto/tls"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -15,10 +17,49 @@ import (
 )
 
 const (
-	defURL = "https://security.access.redhat.com/data/oval/v2/RHEL9/openshift-4-including-unpatched.oval.xml.bz2"
-	defCVE = "CVE-2022-1996"
-	defDur = 5 * time.Minute
+	defDur = 10 * time.Minute
 )
+
+var defaultConfig = Config{
+	Sources: map[string]string{
+		"0": "https://security.access.redhat.com/data/oval/v2/RHEL9/openshift-4-including-unpatched.oval.xml.bz2",
+		"1": "https://security.access.redhat.com/data/oval/v2/RHEL9/rhel-9-including-unpatched.oval.xml.bz2",
+	},
+	Vulns: map[string][]string{
+		"0": {"CVE-2022-1996"},
+		"1": {"RHSA-2024:10244"},
+	},
+}
+
+type Config struct {
+	// Sources maps an arbitrary id to a URL representing an OVAL source.
+	Sources map[string]string `json:"sources,omitempty"`
+	// Vulns maps a source id to a list of vulns.
+	Vulns map[string][]string `json:"vulns,omitempty"`
+}
+
+type Vuln struct {
+	SourceID string   `json:"source,omitempty"`
+	IDs      []string `json:"ids,omitempty"`
+}
+
+func (c Config) String() string {
+	b, err := json.Marshal(c)
+	if err != nil {
+		return fmt.Sprintf("error converting config to string: %v", err)
+	}
+
+	return fmt.Sprint(string(b))
+}
+
+func loadConfig(configPath string) Config {
+	if configPath == "" {
+		return defaultConfig
+	}
+
+	// TODO: load file from configPath
+	return defaultConfig
+}
 
 func envOrDefStr(key string, def string) string {
 	if val := os.Getenv(key); val != "" {
@@ -51,16 +92,16 @@ func init() {
 
 func main() {
 	dur := envOrDefDur("OC_DUR", defDur)
-	cveID := envOrDefStr("OC_CVE", defCVE)
-	url := envOrDefStr("OC_OVAL_URL", defURL)
 
-	log.Printf("Every %v polling for %v from %v", dur, cveID, url)
+	cfg := loadConfig("")
+
+	log.Printf("Polling every %v using config: %v", dur, cfg.String())
 
 	ticker := time.NewTicker(dur)
 	defer ticker.Stop()
 
 	tick := func() {
-		if err := dump(url, cveID); err != nil {
+		if err := dump(cfg); err != nil {
 			log.Printf("FAIL: %v", err)
 		}
 	}
@@ -71,15 +112,53 @@ func main() {
 	}
 }
 
-func dump(url, cveID string) error {
+func dump(cfg Config) error {
+	srcIDs := []string{}
+	for id := range cfg.Sources {
+		srcIDs = append(srcIDs, id)
+	}
+	sort.Strings(srcIDs)
+	for _, srcID := range srcIDs {
+		srcUrl := cfg.Sources[srcID]
+		vulnsToCPE, err := gather(cfg, srcID)
+		if err != nil {
+			return fmt.Errorf("pulling data for source %q: %w", srcUrl, err)
+		}
+
+		var vulnIDs []string
+		for vuln := range vulnsToCPE {
+			vulnIDs = append(vulnIDs, vuln)
+		}
+		sort.Strings(vulnIDs)
+
+		for _, vulnID := range vulnIDs {
+			cpes := vulnsToCPE[vulnID]
+
+			log.Printf("src:%q, vuln:%q, cpes:%q\n", srcID, vulnID, cpes)
+		}
+	}
+
+	return nil
+}
+
+func gather(cfg Config, sourceID string) (map[string]string, error) {
+	url := cfg.Sources[sourceID]
+	vulnsList := cfg.Vulns[sourceID]
+
+	// vulnMap holds CVE/RHSAs from which to pull CPEs for
+	vulnMap := make(map[string]string)
+	for _, v := range vulnsList {
+		vulnMap[v] = ""
+	}
+
 	resp, err := http.Get(url)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("invalid status code %v returned from %s", resp.StatusCode, url)
+		return nil, fmt.Errorf("invalid status code %v returned from %s", resp.StatusCode, url)
 	}
 
 	bzipReader := bzip2.NewReader(resp.Body)
@@ -87,7 +166,7 @@ func dump(url, cveID string) error {
 	var root oval.Root
 	err = xml.NewDecoder(bzipReader).Decode(&root)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	for _, def := range root.Definitions.Definitions {
@@ -95,7 +174,8 @@ func dump(url, cveID string) error {
 			continue
 		}
 		cve := strings.TrimSpace(def.References[0].RefID)
-		if cve != cveID {
+		v, ok := vulnMap[cve]
+		if !ok {
 			continue
 		}
 
@@ -104,8 +184,12 @@ func dump(url, cveID string) error {
 			continue
 		}
 
-		log.Printf("%v: %v\n", cve, def.Advisory.AffectedCPEList)
+		base := ""
+		if v != "" {
+			base = fmt.Sprintf("%s,", v)
+		}
+		vulnMap[cve] = fmt.Sprintf("%s%s", base, strings.Join(def.Advisory.AffectedCPEList, ","))
 	}
 
-	return nil
+	return vulnMap, nil
 }
